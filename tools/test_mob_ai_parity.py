@@ -69,7 +69,7 @@ def scenarios():
     # NoAI only skips serverAiStep: Mob.aiStep's burnUndead still sets a NoAI zombie alight (#3430).
     add('zombie_noai_day_burn', 120, ['mob minecraft:zombie 0.5 -60 0.5 0 33 persistent noai'])
     # AgeableMob.aiStep runs with NoAI, including both signs and age-lock controls.
-    for species in ('pig', 'cow', 'horse', 'turtle'):
+    for species in ('pig', 'cow', 'horse', 'turtle', 'llama'):
         for age in (-2, 2):
             for noai in (False, True):
                 for locked in (False, True):

@@ -636,13 +636,16 @@ pub fn tick(
         if m.species() == Species::Endermite {
             endermite_lifetime(m);
         }
+        // AbstractHorse.aiStep: moveTail's draw comes before Animal.aiStep.
+        let equine = super::equine::is_equine(m.species());
+        if equine {
+            super::equine::tail_tick(m);
+        }
         ageable_step(m, w, level_random, events);
-        // AbstractHorse.tick runs the stand counter down with or without AI.
-        if super::equine::is_equine(m.species())
-            && !super::camel::is_camel(m.species())
-            && !super::llama::is_llama(m.species())
-        {
-            super::equine::stand_tick(m);
+        // AbstractHorse.aiStep's rest (the slow heal, grazing, followMommy)
+        // and tick's stand counter run with or without AI.
+        if equine {
+            super::equine::ai_step(m, w, events);
         }
     } else {
         ai_step(m, w, level_random, events);
@@ -3643,6 +3646,33 @@ mod age_up_tests {
         });
         if !ran {
             eprintln!("age clock regression needs prepared vanilla resources");
+        }
+    }
+
+    /// Official Java 26.3: `Mob.aiStep` runs with NoAI (only `serverAiStep` is
+    /// skipped), so `AbstractHorse.aiStep` still draws moveTail's one in 200,
+    /// the slow heal's one in 900 and the graze's one in 300 after
+    /// `Mob.baseTick`'s ambient-sound draw (parity: mob_ai `horse_age_*_noai_True_*`).
+    #[test]
+    fn no_ai_horse_keeps_its_abstract_horse_ai_step_draws() {
+        let ran = crate::mobs::world::with_test_world(&[], |w, types| {
+            for species in ["horse", "donkey", "mule"] {
+                let kind = Arc::new(types.types[&format!("minecraft:{species}")].clone());
+                let mut m = Mob::new(1, kind, Vec3::new(4.0, 220.0, 4.0), 0.0);
+                m.no_ai = true;
+                m.no_gravity = true;
+                m.persistent = true;
+                let mut expected = m.random.clone();
+                for bound in [1000, 200, 900, 300] {
+                    expected.next_int_bound(bound).unwrap();
+                }
+                let (mut random, mut events) = (LegacyRandom::new(0), Vec::new());
+                tick(&mut m, w, &mut random, &mut events);
+                assert_eq!(m.random.state(), expected.state(), "{species}: NoAI draws");
+            }
+        });
+        if !ran {
+            eprintln!("NoAI horse draw regression needs prepared vanilla resources");
         }
     }
 

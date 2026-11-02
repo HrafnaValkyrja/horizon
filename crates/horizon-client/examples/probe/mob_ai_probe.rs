@@ -1015,7 +1015,8 @@ pub fn main() -> horizon_client::Result<()> {
                 spec.yaw,
             );
             if spec.baby {
-                m.extra.age = -24000;
+                // AgeableMob.setBaby(true): setAge(getBabyStartAge()), -48000 for a sniffer.
+                m.extra.age = horizon_client::mobs::finalize::baby_start_age(m.species());
             }
             for flag in &spec.flags {
                 match flag.as_str() {
