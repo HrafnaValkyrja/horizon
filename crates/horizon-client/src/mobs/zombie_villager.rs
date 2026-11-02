@@ -205,6 +205,7 @@ mod tests {
             nearest_player: None,
             others: &[],
             leash_boats: &[],
+            carts: &[],
             others_grid: None,
             others_index: None,
             daylight: true,

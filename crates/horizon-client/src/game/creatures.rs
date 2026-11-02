@@ -746,6 +746,7 @@ impl Game<'_> {
             player,
             others,
             leash_boats: &self.leash_boats,
+            carts: &self.mob_carts,
             others_grid: None,
             others_index: None,
             daylight: self.dim != Dim::Nether && self.sky_darken() < 4,
@@ -939,6 +940,10 @@ impl Game<'_> {
                 .iter()
                 .map(super::boat_leads::boat_state)
                 .collect();
+            // The carts a mob's pushEntities reaches: id, feet, box.
+            self.mob_carts.clear();
+            self.mob_carts
+                .extend(self.carts.iter().map(|c| (c.id, c.position, c.bounds())));
             let base = self.mob_world_base(&[]);
             let path_changes = horizon_client::mobs::collision_changes(&base, &path_writes);
             // Each mob keeps its snapshot slot all tick; the first slot of an
@@ -1867,6 +1872,13 @@ impl Game<'_> {
                                 m.velocity = m.velocity.add_vector(v);
                             }
                         }
+                    }
+                }
+                MobEvent::PushCart { cart, velocity } => {
+                    if let Some(c) = self.carts.iter_mut().find(|c| c.id == cart) {
+                        c.velocity =
+                            c.velocity
+                                .add_vector(Vec3::new(velocity[0], velocity[1], velocity[2]));
                     }
                 }
                 MobEvent::Knockback {
@@ -7040,6 +7052,7 @@ mod pearl_tests {
             nearest_player: None,
             others: &[],
             leash_boats: &[],
+            carts: &[],
             others_grid: None,
             others_index: None,
             daylight: true,

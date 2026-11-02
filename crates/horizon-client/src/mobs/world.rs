@@ -463,6 +463,7 @@ pub(crate) fn with_resource_test_world(
         nearest_player: None,
         others,
         leash_boats: &[],
+        carts: &[],
         others_grid: None,
         others_index: None,
         daylight: true,

@@ -1474,13 +1474,20 @@ fn push_entities(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
     // EntitySelector.pushableBy(this): the teams' collision rules.
     let own = w.teams.of(Who::Mob(m.id));
     targets.retain(|(who, ..)| crate::scoreboard::pushable_by(own, w.teams.of(*who), true));
+    // Minecarts in the box are pushable too (`AbstractMinecart.isPushable`),
+    // and never riding anything.
+    let touching_carts = w
+        .carts
+        .iter()
+        .filter(|c| c.2.intersects(bounds) && crate::scoreboard::pushable_by(own, None, true))
+        .count();
     // Cramming: a quarter of the ticks spent with `maxEntityCramming` or more
     // others around that are not riding anything hurts it by 6.
     let limit = w.max_entity_cramming;
     if limit > 0
-        && targets.len() as i64 > i64::from(limit) - 1
+        && (targets.len() + touching_carts) as i64 > i64::from(limit) - 1
         && m.random.next_int_bound(4).unwrap_or(1) == 0
-        && targets.iter().filter(|t| !t.2).count() as i64 > i64::from(limit) - 1
+        && (targets.iter().filter(|t| !t.2).count() + touching_carts) as i64 > i64::from(limit) - 1
     {
         m.damage(6.0, Damage::of(DamageKind::Cramming));
     }
@@ -1519,6 +1526,33 @@ fn push_entities(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
         if self_pushable {
             m.velocity = Vec3::new(m.velocity.x + xa, m.velocity.y, m.velocity.z + za);
         }
+    }
+    // `cart.push(this)`: the cart takes the push, and this a quarter of it
+    // back (the cart's own passengers push nothing).
+    for &(id, feet, cart_box) in w.carts {
+        if m.extra.mount == Some(id)
+            || !cart_box.intersects(bounds)
+            || !crate::scoreboard::pushable_by(own, None, true)
+        {
+            continue;
+        }
+        let (xa, za) = (m.position.x - feet.x, m.position.z - feet.z);
+        let dd = xa * xa + za * za;
+        if dd < f64::from(1.0e-4f32) {
+            continue;
+        }
+        let d = dd.sqrt();
+        let k = (1.0 / d).min(1.0) * f64::from(0.1f32) * 0.5;
+        let (xa, za) = (xa / d * k, za / d * k);
+        events.push(MobEvent::PushCart {
+            cart: id,
+            velocity: [-xa, 0.0, -za],
+        });
+        m.velocity = Vec3::new(
+            m.velocity.x + xa / 4.0,
+            m.velocity.y,
+            m.velocity.z + za / 4.0,
+        );
     }
 }
 /// `Mob.aiStep` -> `Mob.burnUndead`: undead burn in daylight. It runs with

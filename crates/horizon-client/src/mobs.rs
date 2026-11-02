@@ -1435,6 +1435,11 @@ pub enum MobEvent {
         target: Who,
         velocity: [f64; 3],
     },
+    /// `AbstractMinecart.push(mob)`: add to a minecart's velocity.
+    PushCart {
+        cart: u32,
+        velocity: [f64; 3],
+    },
     /// `SonicBoom`: 10 damage to the target, then a push along `direction`
     /// (the unit vector from the warden's chest to the target's eyes) only
     /// if the hit landed, less the target's knockback resistance.
@@ -2432,6 +2437,8 @@ pub struct MobWorld<'a> {
     pub others: &'a [Seen],
     /// The boats and rafts a lead can hang on (`Holder::Boat`): id and state.
     pub leash_boats: &'a [(u32, leash::HolderState)],
+    /// The minecarts (id, feet, box) that `pushEntities` can reach.
+    pub carts: &'a [(u32, Vec3, Aabb)],
     /// `others` by position, when the caller keeps one (the mob ticks).
     pub others_grid: Option<&'a seen_grid::SeenGrid>,
     /// Where each id stands in `others`, when the caller keeps one.
