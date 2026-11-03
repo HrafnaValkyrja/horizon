@@ -4808,6 +4808,17 @@ pub fn {f}("
 
     #[test]
     fn prepared_versions_get_what_the_asset_store_adds_without_preparing_again() {
+        // Another test spawning processes while this one holds the lock, as the whole suite does:
+        // kept running here so the overlap happens on every run, not now and then (#8001).
+        let spawning = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let spawner = {
+            let spawning = spawning.clone();
+            std::thread::spawn(move || {
+                while spawning.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = std::process::Command::new("true").status();
+                }
+            })
+        };
         let dir = std::env::temp_dir().join(format!(
             "horizon-launcher-packs-test-{}",
             std::process::id()
@@ -4969,6 +4980,8 @@ pub fn {f}("
         assert!(lines.borrow().is_empty());
         assert!(!resources_at(&versions.join("v0.2.3")).exists());
         let _ = fs::remove_dir_all(&dir);
+        spawning.store(false, std::sync::atomic::Ordering::Relaxed);
+        spawner.join().unwrap();
     }
 
     #[test]
