@@ -2,6 +2,7 @@
 //! chunk-generation spawning (`NaturalSpawner`), mob events (attacks,
 //! breeding, conversions, drops), projectiles, player interactions
 //! (feeding, shearing, milking, spawn eggs, throwing) and rendering.
+use horizon_client::join_seq::JoinSeq;
 use super::{
     Dim, Game, Hand, InteractTarget, dispenser, native_mob_draw::NativePlayerRender,
     native_projectiles::Impact, view_vector,
@@ -1237,8 +1238,7 @@ impl Game<'_> {
         }
         self.handle_mob_events(events)?;
         self.lan_guest_mob_events(guest_events);
-        self.ordered_before(super::ordered_tick::Batch::Projectiles)?;
-        self.tick_projectiles()?;
+        self.tick_projectile_rest()?;
         self.tick_fangs();
         self.tick_allays();
         self.tick_pandas();
@@ -3835,7 +3835,8 @@ impl Game<'_> {
         }
     }
 
-    fn tick_projectiles(&mut self) -> Result<()> {
+    /// `ServerLevel.tick` for the projectiles that joined in `lo..hi`.
+    pub(super) fn tick_projectiles(&mut self, lo: JoinSeq, hi: JoinSeq) -> Result<()> {
         let mut projectiles = std::mem::take(&mut self.creatures.projectiles);
         let mut hits = Vec::new();
         let mut deflections: Vec<[f64; 3]> = Vec::new();
@@ -3857,10 +3858,14 @@ impl Game<'_> {
                 .collect();
             // Drawn only when a breeze could deflect a projectile: an empty
             // level must not move the level random every tick.
-            let jitter = if breezes.is_empty() || projectiles.is_empty() {
+            let due = |p: &Projectile| p.join >= lo && p.join < hi;
+            let jitter = if breezes.is_empty() || !projectiles.iter().any(due) {
                 0.0
             } else {
-                self.world.random.next_float()
+                *self
+                    .ordered
+                    .jitter
+                    .get_or_insert_with(|| self.world.random.next_float())
             };
             let w = self.mob_world_base(&[]);
             let rain = self.arrow_rain();
@@ -3925,6 +3930,9 @@ impl Game<'_> {
                     .collect()
             });
             for i in 0..projectiles.len() {
+                if !due(&projectiles[i]) {
+                    continue;
+                }
                 // A wind charge is pickable, so a pearl, an arrow or a trident can
                 // strike it (`Projectile.isPickable`, `Projectile.onHit`).
                 let winds = if matches!(projectiles[i].kind, ProjectileKind::EnderPearl)

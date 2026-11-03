@@ -1,4 +1,4 @@
-//! PURPOSE: ticks experience orbs, primed TNT, falling blocks, and firework rockets in the order
+//! PURPOSE: ticks experience orbs, primed TNT, falling blocks, firework rockets and projectiles in the order
 //! they joined the level, between the other kinds' batches.
 //! WHY: `ServerLevel.tick` ticks every entity in join order, one kind among
 //! the rest; these three used to tick as three fixed batches (orbs after the
@@ -28,6 +28,8 @@ pub(super) struct OrderedTicks {
     suffix_min: [JoinSeq; Batch::COUNT],
     /// The orbs' lava random, made on first use.
     lava_random: Option<horizon_core::random::LegacyRandom>,
+    /// The breeze deflection's jitter, drawn on the tick's first projectile batch.
+    pub(super) jitter: Option<f32>,
 }
 
 /// The batches of the other kinds, in the order they tick.
@@ -39,11 +41,10 @@ pub(super) enum Batch {
     Tridents,
     Items,
     Mobs,
-    Projectiles,
 }
 
 impl Batch {
-    const COUNT: usize = 7;
+    const COUNT: usize = 6;
 }
 
 #[derive(Clone, Copy)]
@@ -52,6 +53,8 @@ enum Pending {
     Tnt,
     Falling,
     Rocket,
+    /// The projectile batch (wind charges, arrows, tridents' siblings, snowballs...).
+    Projectile,
 }
 
 /// The lowest join number in a batch, or none when it is empty.
@@ -69,7 +72,6 @@ impl Game<'_> {
             first_join(&self.tridents),
             first_join(&self.dropped),
             first_join(&self.mobs),
-            first_join(&self.creatures.projectiles),
         ];
         // A batch ticks whole, so an entity of the three kinds goes after the
         // last batch that holds anything that joined before it.
@@ -85,17 +87,14 @@ impl Game<'_> {
             done: None,
             suffix_min,
             lava_random: None,
+            jitter: None,
         };
     }
 
-    /// The join number of the first orb, primed TNT or falling block still to
-    /// tick before the spawn packets (the mob loop's cue to stop and run it).
-    /// Like [`Self::ordered_before`]'s cut, for the mob loop: nothing joined
-    /// after what the projectile batch (which ticks whole, after every mob)
-    /// holds may tick before that batch.
+    /// The join number of the first orb, primed TNT, falling block, rocket or
+    /// projectile still to tick (the mob loop's cue to stop and run it).
     pub(super) fn next_ordered_join(&self) -> Option<JoinSeq> {
-        let cap = self.ordered.suffix_min[Batch::Projectiles as usize];
-        self.next_ordered_join_any().filter(|j| *j < cap)
+        self.next_ordered_join_any()
     }
 
     fn next_ordered_join_any(&self) -> Option<JoinSeq> {
@@ -103,13 +102,19 @@ impl Game<'_> {
             (self.ordered.done, self.ordered.born, self.ordered.announced);
         let wanted = |j: JoinSeq| done.is_none_or(|d| j > d) && j < born;
         let orbs = self.orbs.iter().map(|e| e.join);
+        let rockets = self.rockets.iter().map(|e| e.join);
+        let shots = self.creatures.projectiles.iter().map(|p| p.join);
         let rest = self
             .tnts
             .iter()
             .map(|e| e.join)
             .chain(self.falling.iter().map(|e| e.join))
             .filter(|j| *j < announced);
-        orbs.chain(rest).filter(|j| wanted(*j)).min()
+        orbs.chain(rockets)
+            .chain(shots)
+            .chain(rest)
+            .filter(|j| wanted(*j))
+            .min()
     }
 
     /// Ticks, one at a time in join order, every orb, primed TNT and falling
@@ -124,15 +129,22 @@ impl Game<'_> {
                 (self.ordered.done, self.ordered.born, self.ordered.announced);
             let wanted = |j: JoinSeq| done.is_none_or(|d| j > d) && j < cut && j < born;
             let mut next: Option<(JoinSeq, Pending)> = None;
+            // The first of the others, when the projectile batch is next.
+            let mut other: Option<JoinSeq> = None;
             let mut offer = |j: JoinSeq, kind: Pending| {
                 // Orbs are announced after their tick, always; TNT and falling
                 // blocks that joined since the last packets wait for them.
                 let right_pass = match kind {
-                    Pending::Orb | Pending::Rocket => !late,
+                    Pending::Orb | Pending::Rocket | Pending::Projectile => !late,
                     _ => late == (j >= announced),
                 };
-                if right_pass && wanted(j) && next.is_none_or(|(n, _)| j < n) {
-                    next = Some((j, kind));
+                if right_pass && wanted(j) {
+                    if next.is_none_or(|(n, _)| j < n) {
+                        next = Some((j, kind));
+                    }
+                    if !matches!(kind, Pending::Projectile) && other.is_none_or(|o| j < o) {
+                        other = Some(j);
+                    }
                 }
             };
             self.orbs.iter().for_each(|e| offer(e.join, Pending::Orb));
@@ -143,7 +155,47 @@ impl Game<'_> {
             self.rockets
                 .iter()
                 .for_each(|e| offer(e.join, Pending::Rocket));
+            self.creatures
+                .projectiles
+                .iter()
+                .for_each(|e| offer(e.join, Pending::Projectile));
             let Some((join, kind)) = next else { break };
+            if matches!(kind, Pending::Projectile) {
+                // Every projectile up to the next entity of another kind, in
+                // one pass (the batch's setup is the cost, not the tick).
+                let hi = other.unwrap_or(JoinSeq::MAX).min(cut).min(born);
+                let lo = done.map_or(JoinSeq::UNJOINED, JoinSeq::after);
+                // A wind charge ends the pass: its burst pushes what ticks
+                // after it, so it goes out before the next projectile ticks.
+                let hi = self
+                    .creatures
+                    .projectiles
+                    .iter()
+                    .filter(|p| {
+                        matches!(
+                            p.kind,
+                            horizon_client::projectiles::ProjectileKind::WindCharge
+                                | horizon_client::projectiles::ProjectileKind::BreezeWindCharge
+                        )
+                    })
+                    .map(|p| p.join)
+                    .filter(|j| *j >= lo && *j < hi)
+                    .min()
+                    .map_or(hi, JoinSeq::after);
+                let last = self
+                    .creatures
+                    .projectiles
+                    .iter()
+                    .map(|p| p.join)
+                    .filter(|j| *j >= lo && *j < hi)
+                    .max()
+                    .unwrap_or(join);
+                self.ordered.done = Some(last);
+                if let Err(e) = self.tick_projectiles(lo, hi) {
+                    first_error.get_or_insert(e);
+                }
+                continue;
+            }
             self.ordered.done = Some(join);
             // ServerLevel.tick: only entities in entity-ticking chunks tick.
             match kind {
@@ -170,6 +222,7 @@ impl Game<'_> {
                         }
                     }
                 }
+                Pending::Projectile => {}
                 Pending::Rocket => {
                     if let Some(i) = self.rockets.iter().position(|e| e.join == join) {
                         self.tick_one_rocket(i);
@@ -229,5 +282,23 @@ impl Game<'_> {
             return Ok(());
         }
         self.run_ordered_ticks(cut, false)
+    }
+
+    /// The projectile batch, whole: whatever of it has not ticked, after the
+    /// orbs, TNT, falling blocks and rockets that joined before it.
+    pub(super) fn tick_projectile_rest(&mut self) -> Result<()> {
+        let born = self.ordered.born;
+        let last = self
+            .creatures
+            .projectiles
+            .iter()
+            .map(|p| p.join)
+            .filter(|j| *j < born)
+            .max();
+        if let Some(last) = last {
+            self.run_ordered_ticks(last.after(), false)?;
+        }
+        // Shot during this tick: they tick with the batch, as before.
+        self.tick_projectiles(born, JoinSeq::MAX)
     }
 }

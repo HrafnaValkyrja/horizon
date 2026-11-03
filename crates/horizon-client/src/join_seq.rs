@@ -34,6 +34,10 @@ impl JoinSeq {
     pub fn upcoming() -> Self {
         Self(NEXT.load(Ordering::Relaxed))
     }
+    /// The number right after this one: every join above this one is at or above it.
+    pub fn after(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
     pub fn is_joined(self) -> bool {
         self.0 != 0
     }
