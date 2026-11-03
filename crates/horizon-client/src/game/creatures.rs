@@ -32,6 +32,7 @@ use horizon_core::{
     position::BlockPos,
     random::RandomSource,
 };
+use horizon_client::join_seq::Joined as _;
 use std::sync::Arc;
 
 /// The world impact sound after successful arrow damage, including self-shots.
@@ -1010,6 +1011,21 @@ impl Game<'_> {
             let mut keep = Vec::with_capacity(mobs.len());
             let mut grid =
                 horizon_client::mobs::seen_grid::SeenGrid::new(snapshot.iter().map(|s| s.bounds));
+            // Each mob keeps its snapshot slot all tick; the first slot of an
+            // id answers, as a scan would.
+            let mut index = horizon_client::fast_hash::FxHashMap::<u32, u32>::default();
+            for (i, s) in snapshot.iter().enumerate() {
+                index.entry(s.id).or_insert(i as u32);
+            }
+            // ServerLevel.tick ticks every entity one after another in join
+            // order: an orb, primed TNT or falling block that joined before a
+            // mob ticks before it (game/ordered_tick.rs). The loop runs in
+            // segments; a segment ends where such an entity is due, the mobs
+            // go back into the level for it to act on, and the next segment
+            // starts from a fresh view.
+            let mut pending = self.next_ordered_join();
+            let mut start = 0;
+            loop {
             // All but the snapshot is the same for every mob of the tick, so
             // build it once: the player view and the teams scan every UUID.
             self.leash_boats = self
@@ -1019,13 +1035,14 @@ impl Game<'_> {
                 .collect();
             let base = self.mob_world_base(&[]);
             let path_changes = horizon_client::mobs::collision_changes(&base, &path_writes);
-            // Each mob keeps its snapshot slot all tick; the first slot of an
-            // id answers, as a scan would.
-            let mut index = horizon_client::fast_hash::FxHashMap::<u32, u32>::default();
-            for (i, s) in snapshot.iter().enumerate() {
-                index.entry(s.id).or_insert(i as u32);
-            }
-            for i in 0..mobs.len() {
+            let mut resume = None;
+            for i in start..mobs.len() {
+                if let Some(due) = pending
+                    && due < mobs[i].join_seq()
+                {
+                    resume = Some(i);
+                    break;
+                }
                 let mut w = MobWorld {
                     others: &snapshot,
                     others_grid: Some(&grid),
@@ -1131,6 +1148,33 @@ impl Game<'_> {
                 snapshot[i].alive &= kept;
                 grid.update(i, snapshot[i].bounds);
                 horizon_client::mobs::apply_brain_events(&mut mobs, &mut events, from);
+            }
+            let Some(i) = resume else { break };
+            // Hand the mobs and the level random back, tick what is due, take
+            // them again. Mobs added meanwhile wait at the end of `self.mobs`.
+            let cut = mobs[i].join_seq();
+            let waiting = std::mem::take(&mut self.mobs);
+            let count = mobs.len();
+            self.world.random = scratch;
+            self.mobs = std::mem::take(&mut mobs);
+            let ran = self.run_ordered_ticks(cut, false);
+            mobs = std::mem::replace(&mut self.mobs, waiting);
+            if mobs.len() > count {
+                let added = mobs.split_off(count);
+                self.mobs.extend(added);
+            }
+            scratch = self.world.random.clone();
+            ran?;
+            pending = self.next_ordered_join().filter(|due| *due >= cut);
+            for (k, s) in snapshot.iter_mut().enumerate() {
+                if let Some(m) = mobs.get(k) {
+                    let alive = s.alive;
+                    *s = seen(m, uuid);
+                    s.alive &= alive;
+                }
+            }
+            grid = horizon_client::mobs::seen_grid::SeenGrid::new(snapshot.iter().map(|s| s.bounds));
+            start = i;
             }
             let mut flags = keep.into_iter();
             mobs.retain(|_| flags.next().unwrap_or(true));

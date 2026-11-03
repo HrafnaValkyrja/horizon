@@ -89,6 +89,30 @@ impl Game<'_> {
         };
     }
 
+    /// The join number of the first orb, primed TNT or falling block still to
+    /// tick before the spawn packets (the mob loop's cue to stop and run it).
+    /// Like [`Self::ordered_before`]'s cut, for the mob loop: nothing joined
+    /// after what the projectile batch (which ticks whole, after every mob)
+    /// holds may tick before that batch.
+    pub(super) fn next_ordered_join(&self) -> Option<JoinSeq> {
+        let cap = self.ordered.suffix_min[Batch::Projectiles as usize];
+        self.next_ordered_join_any().filter(|j| *j < cap)
+    }
+
+    fn next_ordered_join_any(&self) -> Option<JoinSeq> {
+        let (done, born, announced) =
+            (self.ordered.done, self.ordered.born, self.ordered.announced);
+        let wanted = |j: JoinSeq| done.is_none_or(|d| j > d) && j < born;
+        let orbs = self.orbs.iter().map(|e| e.join);
+        let rest = self
+            .tnts
+            .iter()
+            .map(|e| e.join)
+            .chain(self.falling.iter().map(|e| e.join))
+            .filter(|j| *j < announced);
+        orbs.chain(rest).filter(|j| wanted(*j)).min()
+    }
+
     /// Ticks, one at a time in join order, every orb, primed TNT and falling
     /// block that joined before `cut` and has not ticked this tick.
     pub(super) fn run_ordered_ticks(&mut self, cut: JoinSeq, late: bool) -> Result<()> {
