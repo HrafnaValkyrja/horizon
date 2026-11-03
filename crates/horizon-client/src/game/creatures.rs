@@ -7,6 +7,7 @@ use super::{
     native_projectiles::Impact, view_vector,
 };
 use horizon_assets::item_model::DisplayContext;
+use horizon_client::join_seq::Joined as _;
 use horizon_client::{
     Result,
     arrows::EntityHit,
@@ -32,7 +33,6 @@ use horizon_core::{
     position::BlockPos,
     random::RandomSource,
 };
-use horizon_client::join_seq::Joined as _;
 use std::sync::Arc;
 
 /// The world impact sound after successful arrow damage, including self-shots.
@@ -1026,155 +1026,160 @@ impl Game<'_> {
             let mut pending = self.next_ordered_join();
             let mut start = 0;
             loop {
-            // All but the snapshot is the same for every mob of the tick, so
-            // build it once: the player view and the teams scan every UUID.
-            self.leash_boats = self
-                .boats
-                .iter()
-                .map(super::boat_leads::boat_state)
-                .collect();
-            let base = self.mob_world_base(&[]);
-            let path_changes = horizon_client::mobs::collision_changes(&base, &path_writes);
-            let mut resume = None;
-            for i in start..mobs.len() {
-                if let Some(due) = pending
-                    && due < mobs[i].join_seq()
-                {
-                    resume = Some(i);
-                    break;
-                }
-                let mut w = MobWorld {
-                    others: &snapshot,
-                    others_grid: Some(&grid),
-                    others_index: Some(&index),
-                    ..base.clone()
-                };
-                let m = &mut mobs[i];
-                // getCurrentDifficultyAt(blockPosition()): the mob's own chunk,
-                // not the local player's (a server thread has no player).
-                w.difficulty = self.local_difficulty([m.position.x, m.position.y, m.position.z]);
-                w.nearest_player = nearest
-                    .nearest(m.position.x, m.position.y, m.position.z)
-                    .map(|p| p.position);
-                let seen_guest = if guests.is_empty() {
-                    None
-                } else {
-                    let bound = bindings.get(&m.id).copied();
-                    let conn = super::lan_mobs::player_for(m, w.player.as_ref(), &guests, bound);
-                    match conn {
-                        Some(conn) => {
-                            bindings.insert(m.id, conn);
-                            w.player = guests.iter().find(|g| g.0 == conn).map(|g| g.1.clone());
-                        }
-                        None => {
-                            bindings.remove(&m.id);
-                        }
+                // All but the snapshot is the same for every mob of the tick, so
+                // build it once: the player view and the teams scan every UUID.
+                self.leash_boats = self
+                    .boats
+                    .iter()
+                    .map(super::boat_leads::boat_state)
+                    .collect();
+                let base = self.mob_world_base(&[]);
+                let path_changes = horizon_client::mobs::collision_changes(&base, &path_writes);
+                let mut resume = None;
+                for i in start..mobs.len() {
+                    if let Some(due) = pending
+                        && due < mobs[i].join_seq()
+                    {
+                        resume = Some(i);
+                        break;
                     }
-                    conn
-                };
-                if !w
-                    .world
-                    .loaded(m.position.x.floor() as i32, m.position.z.floor() as i32)
-                {
-                    keep.push(!m.hostile() || m.persistent);
-                    continue;
-                }
-                // ServerLevel.tick: every loaded entity checks despawning, but
-                // only those in entity-ticking chunks (within the simulation
-                // distance) tick.
-                if !ticking(m.position.x.floor() as i32, m.position.z.floor() as i32) {
-                    let kept = horizon_client::mobs::ai::despawn_check(m, &w);
-                    if !kept {
-                        died.remove(&m.id);
-                        snapshot[i].alive = false;
+                    let mut w = MobWorld {
+                        others: &snapshot,
+                        others_grid: Some(&grid),
+                        others_index: Some(&index),
+                        ..base.clone()
+                    };
+                    let m = &mut mobs[i];
+                    // getCurrentDifficultyAt(blockPosition()): the mob's own chunk,
+                    // not the local player's (a server thread has no player).
+                    w.difficulty =
+                        self.local_difficulty([m.position.x, m.position.y, m.position.z]);
+                    w.nearest_player = nearest
+                        .nearest(m.position.x, m.position.y, m.position.z)
+                        .map(|p| p.position);
+                    let seen_guest = if guests.is_empty() {
+                        None
+                    } else {
+                        let bound = bindings.get(&m.id).copied();
+                        let conn =
+                            super::lan_mobs::player_for(m, w.player.as_ref(), &guests, bound);
+                        match conn {
+                            Some(conn) => {
+                                bindings.insert(m.id, conn);
+                                w.player = guests.iter().find(|g| g.0 == conn).map(|g| g.1.clone());
+                            }
+                            None => {
+                                bindings.remove(&m.id);
+                            }
+                        }
+                        conn
+                    };
+                    if !w
+                        .world
+                        .loaded(m.position.x.floor() as i32, m.position.z.floor() as i32)
+                    {
+                        keep.push(!m.hostile() || m.persistent);
+                        continue;
                     }
-                    keep.push(kept);
-                    continue;
-                }
-                // A mod canceled its tick: it stays as it is.
-                if round.canceled(m.id) {
-                    keep.push(true);
-                    continue;
-                }
-                horizon_client::mobs::apply_mob_pushes(m, &mut pushes);
-                horizon_client::mobs::blocks_changed(m, &path_changes);
-                let from = events.len();
-                let kept = m.tick(&w, &mut scratch, &mut events);
-                // A killed mob's body is removed: its effects that act on
-                // death run (`LivingEntity.remove` with KILLED).
-                if !kept && !m.alive() && !m.removed && !m.extra.effects.is_empty() {
-                    corpses.push(m.clone());
-                }
-                horizon_client::mobs::take_mob_pushes(&mut events, from, &mut pushes);
-                // LivingEntity.tickDeath: after twenty ticks the body is removed.
-                if !kept && !m.removed && !m.alive() && m.death_time >= 20 {
-                    let (width, height) = (f64::from(m.width()), f64::from(m.height()));
-                    gone.push((m.id, m.position, width, height));
-                }
-                if let Some(conn) = seen_guest {
-                    // ShulkerBullet.finalTarget is the guest's entity: the
-                    // bullet homes on it while the projectiles tick, where
-                    // `Who::Player` is the host's own player.
-                    if let Some(&(_, id)) = guest_ids.iter().find(|g| g.0 == conn) {
-                        for e in &mut events[from..] {
-                            if let MobEvent::Projectile(p) = e
-                                && let ProjectileKind::ShulkerBullet { target, .. } = &mut p.kind
-                                && *target == Some(Who::Player)
-                            {
-                                *target = Some(Who::Mob(id));
+                    // ServerLevel.tick: every loaded entity checks despawning, but
+                    // only those in entity-ticking chunks (within the simulation
+                    // distance) tick.
+                    if !ticking(m.position.x.floor() as i32, m.position.z.floor() as i32) {
+                        let kept = horizon_client::mobs::ai::despawn_check(m, &w);
+                        if !kept {
+                            died.remove(&m.id);
+                            snapshot[i].alive = false;
+                        }
+                        keep.push(kept);
+                        continue;
+                    }
+                    // A mod canceled its tick: it stays as it is.
+                    if round.canceled(m.id) {
+                        keep.push(true);
+                        continue;
+                    }
+                    horizon_client::mobs::apply_mob_pushes(m, &mut pushes);
+                    horizon_client::mobs::blocks_changed(m, &path_changes);
+                    let from = events.len();
+                    let kept = m.tick(&w, &mut scratch, &mut events);
+                    // A killed mob's body is removed: its effects that act on
+                    // death run (`LivingEntity.remove` with KILLED).
+                    if !kept && !m.alive() && !m.removed && !m.extra.effects.is_empty() {
+                        corpses.push(m.clone());
+                    }
+                    horizon_client::mobs::take_mob_pushes(&mut events, from, &mut pushes);
+                    // LivingEntity.tickDeath: after twenty ticks the body is removed.
+                    if !kept && !m.removed && !m.alive() && m.death_time >= 20 {
+                        let (width, height) = (f64::from(m.width()), f64::from(m.height()));
+                        gone.push((m.id, m.position, width, height));
+                    }
+                    if let Some(conn) = seen_guest {
+                        // ShulkerBullet.finalTarget is the guest's entity: the
+                        // bullet homes on it while the projectiles tick, where
+                        // `Who::Player` is the host's own player.
+                        if let Some(&(_, id)) = guest_ids.iter().find(|g| g.0 == conn) {
+                            for e in &mut events[from..] {
+                                if let MobEvent::Projectile(p) = e
+                                    && let ProjectileKind::ShulkerBullet { target, .. } =
+                                        &mut p.kind
+                                    && *target == Some(Who::Player)
+                                {
+                                    *target = Some(Who::Mob(id));
+                                }
+                            }
+                        }
+                        let mut k = from;
+                        while k < events.len() {
+                            if super::lan_mobs::acts_on_player(&events[k]) {
+                                guest_events.push((conn, events.remove(k)));
+                            } else {
+                                k += 1;
                             }
                         }
                     }
-                    let mut k = from;
-                    while k < events.len() {
-                        if super::lan_mobs::acts_on_player(&events[k]) {
-                            guest_events.push((conn, events.remove(k)));
-                        } else {
-                            k += 1;
-                        }
+                    // Killed during its own tick (drowning, burning, falling...).
+                    if !m.alive() && !m.removed && died.insert(m.id) {
+                        dead.push(m.clone());
+                    }
+                    if !kept {
+                        died.remove(&m.id);
+                    }
+                    keep.push(kept);
+                    // ServerLevel ticks entities one after another: the ones
+                    // after this mob see it as it is now.
+                    snapshot[i] = seen(m, uuid);
+                    snapshot[i].alive &= kept;
+                    grid.update(i, snapshot[i].bounds);
+                    horizon_client::mobs::apply_brain_events(&mut mobs, &mut events, from);
+                }
+                let Some(i) = resume else { break };
+                // Hand the mobs and the level random back, tick what is due, take
+                // them again. Mobs added meanwhile wait at the end of `self.mobs`.
+                let cut = mobs[i].join_seq();
+                let waiting = std::mem::take(&mut self.mobs);
+                let count = mobs.len();
+                self.world.random = scratch;
+                self.mobs = std::mem::take(&mut mobs);
+                let ran = self.run_ordered_ticks(cut, false);
+                mobs = std::mem::replace(&mut self.mobs, waiting);
+                if mobs.len() > count {
+                    let added = mobs.split_off(count);
+                    self.mobs.extend(added);
+                }
+                scratch = self.world.random.clone();
+                ran?;
+                pending = self.next_ordered_join().filter(|due| *due >= cut);
+                for (k, s) in snapshot.iter_mut().enumerate() {
+                    if let Some(m) = mobs.get(k) {
+                        let alive = s.alive;
+                        *s = seen(m, uuid);
+                        s.alive &= alive;
                     }
                 }
-                // Killed during its own tick (drowning, burning, falling...).
-                if !m.alive() && !m.removed && died.insert(m.id) {
-                    dead.push(m.clone());
-                }
-                if !kept {
-                    died.remove(&m.id);
-                }
-                keep.push(kept);
-                // ServerLevel ticks entities one after another: the ones
-                // after this mob see it as it is now.
-                snapshot[i] = seen(m, uuid);
-                snapshot[i].alive &= kept;
-                grid.update(i, snapshot[i].bounds);
-                horizon_client::mobs::apply_brain_events(&mut mobs, &mut events, from);
-            }
-            let Some(i) = resume else { break };
-            // Hand the mobs and the level random back, tick what is due, take
-            // them again. Mobs added meanwhile wait at the end of `self.mobs`.
-            let cut = mobs[i].join_seq();
-            let waiting = std::mem::take(&mut self.mobs);
-            let count = mobs.len();
-            self.world.random = scratch;
-            self.mobs = std::mem::take(&mut mobs);
-            let ran = self.run_ordered_ticks(cut, false);
-            mobs = std::mem::replace(&mut self.mobs, waiting);
-            if mobs.len() > count {
-                let added = mobs.split_off(count);
-                self.mobs.extend(added);
-            }
-            scratch = self.world.random.clone();
-            ran?;
-            pending = self.next_ordered_join().filter(|due| *due >= cut);
-            for (k, s) in snapshot.iter_mut().enumerate() {
-                if let Some(m) = mobs.get(k) {
-                    let alive = s.alive;
-                    *s = seen(m, uuid);
-                    s.alive &= alive;
-                }
-            }
-            grid = horizon_client::mobs::seen_grid::SeenGrid::new(snapshot.iter().map(|s| s.bounds));
-            start = i;
+                grid = horizon_client::mobs::seen_grid::SeenGrid::new(
+                    snapshot.iter().map(|s| s.bounds),
+                );
+                start = i;
             }
             let mut flags = keep.into_iter();
             mobs.retain(|_| flags.next().unwrap_or(true));
