@@ -62,6 +62,17 @@ pub(super) fn first_join<T: Joined>(list: &[T]) -> Option<JoinSeq> {
     list.iter().map(Joined::join_seq).min()
 }
 
+/// Where the entity that joined as `join` is in `list`, if still there. A list
+/// is usually in join order (spawns append), so a binary search finds it; a
+/// list put back out of order falls back to the walk.
+fn find_join<T: Joined>(list: &[T], join: JoinSeq) -> Option<usize> {
+    match list.binary_search_by_key(&join, Joined::join_seq) {
+        // Join numbers are unique, so a hit is the entity even in a list out of order.
+        Ok(i) => Some(i),
+        Err(_) => list.iter().position(|e| e.join_seq() == join),
+    }
+}
+
 impl Game<'_> {
     /// A level tick starts: what has joined so far ticks this tick.
     pub(super) fn begin_ordered_ticks(&mut self) {
@@ -124,74 +135,69 @@ impl Game<'_> {
         let mut followed = None;
         let mut events = false;
         let entity_ticking = self.entity_ticking_area();
-        loop {
-            let (done, born, announced) =
-                (self.ordered.done, self.ordered.born, self.ordered.announced);
-            let wanted = |j: JoinSeq| done.is_none_or(|d| j > d) && j < cut && j < born;
-            let mut next: Option<(JoinSeq, Pending)> = None;
-            // The first of the others, when the projectile batch is next.
-            let mut other: Option<JoinSeq> = None;
-            let mut offer = |j: JoinSeq, kind: Pending| {
-                // Orbs are announced after their tick, always; TNT and falling
-                // blocks that joined since the last packets wait for them.
-                let right_pass = match kind {
-                    Pending::Orb | Pending::Rocket | Pending::Projectile => !late,
-                    _ => late == (j >= announced),
-                };
-                if right_pass && wanted(j) {
-                    if next.is_none_or(|(n, _)| j < n) {
-                        next = Some((j, kind));
-                    }
-                    if !matches!(kind, Pending::Projectile) && other.is_none_or(|o| j < o) {
-                        other = Some(j);
-                    }
-                }
+        // Who ticks in this run, sorted once: entities that join meanwhile are
+        // at or above `born`, so the set cannot grow, only lose the removed.
+        let (done, born, announced) =
+            (self.ordered.done, self.ordered.born, self.ordered.announced);
+        let wanted = |j: JoinSeq| done.is_none_or(|d| j > d) && j < cut && j < born;
+        let mut pending: Vec<(JoinSeq, Pending)> = Vec::new();
+        let mut offer = |j: JoinSeq, kind: Pending| {
+            // Orbs are announced after their tick, always; TNT and falling
+            // blocks that joined since the last packets wait for them.
+            let right_pass = match kind {
+                Pending::Orb | Pending::Rocket | Pending::Projectile => !late,
+                _ => late == (j >= announced),
             };
-            self.orbs.iter().for_each(|e| offer(e.join, Pending::Orb));
-            self.tnts.iter().for_each(|e| offer(e.join, Pending::Tnt));
-            self.falling
-                .iter()
-                .for_each(|e| offer(e.join, Pending::Falling));
-            self.rockets
-                .iter()
-                .for_each(|e| offer(e.join, Pending::Rocket));
-            self.creatures
-                .projectiles
-                .iter()
-                .for_each(|e| offer(e.join, Pending::Projectile));
-            let Some((join, kind)) = next else { break };
+            if right_pass && wanted(j) {
+                pending.push((j, kind));
+            }
+        };
+        self.orbs.iter().for_each(|e| offer(e.join, Pending::Orb));
+        self.tnts.iter().for_each(|e| offer(e.join, Pending::Tnt));
+        self.falling
+            .iter()
+            .for_each(|e| offer(e.join, Pending::Falling));
+        self.rockets
+            .iter()
+            .for_each(|e| offer(e.join, Pending::Rocket));
+        self.creatures
+            .projectiles
+            .iter()
+            .for_each(|e| offer(e.join, Pending::Projectile));
+        pending.sort_unstable_by_key(|&(j, _)| j);
+        let wind = |this: &Self, join: JoinSeq| {
+            this.creatures.projectiles.iter().any(|p| {
+                p.join == join
+                    && matches!(
+                        p.kind,
+                        horizon_client::projectiles::ProjectileKind::WindCharge
+                            | horizon_client::projectiles::ProjectileKind::BreezeWindCharge
+                    )
+            })
+        };
+        let mut at = 0;
+        while at < pending.len() {
+            let (join, kind) = pending[at];
+            at += 1;
             if matches!(kind, Pending::Projectile) {
                 // Every projectile up to the next entity of another kind, in
-                // one pass (the batch's setup is the cost, not the tick).
-                let hi = other.unwrap_or(JoinSeq::MAX).min(cut).min(born);
-                let lo = done.map_or(JoinSeq::UNJOINED, JoinSeq::after);
-                // A wind charge ends the pass: its burst pushes what ticks
-                // after it, so it goes out before the next projectile ticks.
-                let hi = self
-                    .creatures
-                    .projectiles
-                    .iter()
-                    .filter(|p| {
-                        matches!(
-                            p.kind,
-                            horizon_client::projectiles::ProjectileKind::WindCharge
-                                | horizon_client::projectiles::ProjectileKind::BreezeWindCharge
-                        )
-                    })
-                    .map(|p| p.join)
-                    .filter(|j| *j >= lo && *j < hi)
-                    .min()
-                    .map_or(hi, JoinSeq::after);
-                let last = self
-                    .creatures
-                    .projectiles
-                    .iter()
-                    .map(|p| p.join)
-                    .filter(|j| *j >= lo && *j < hi)
-                    .max()
-                    .unwrap_or(join);
+                // one pass (the batch's setup is the cost, not the tick). A
+                // wind charge ends the pass: its burst pushes what ticks after
+                // it, so it goes out before the next projectile ticks.
+                let mut last = join;
+                let mut ended = wind(self, join);
+                while !ended && let Some(&(j, Pending::Projectile)) = pending.get(at) {
+                    last = j;
+                    at += 1;
+                    ended = wind(self, j);
+                }
+                let hi = if ended {
+                    last.after()
+                } else {
+                    pending.get(at).map_or(cut.min(born), |&(j, _)| j)
+                };
                 self.ordered.done = Some(last);
-                if let Err(e) = self.tick_projectiles(lo, hi) {
+                if let Err(e) = self.tick_projectiles(join, hi) {
                     first_error.get_or_insert(e);
                 }
                 continue;
@@ -200,7 +206,7 @@ impl Game<'_> {
             // ServerLevel.tick: only entities in entity-ticking chunks tick.
             match kind {
                 Pending::Tnt => {
-                    let Some(i) = self.tnts.iter().position(|e| e.join == join) else {
+                    let Some(i) = find_join(&self.tnts, join) else {
                         continue;
                     };
                     let at = self.tnts[i].position;
@@ -211,7 +217,7 @@ impl Game<'_> {
                     }
                 }
                 Pending::Falling => {
-                    let Some(i) = self.falling.iter().position(|e| e.join == join) else {
+                    let Some(i) = find_join(&self.falling, join) else {
                         continue;
                     };
                     let at = self.falling[i].position;
@@ -229,7 +235,7 @@ impl Game<'_> {
                     }
                 }
                 Pending::Orb => {
-                    let Some(i) = self.orbs.iter().position(|e| e.join == join) else {
+                    let Some(i) = find_join(&self.orbs, join) else {
                         continue;
                     };
                     let followed = followed.get_or_insert_with(|| self.orb_followed());
@@ -300,5 +306,40 @@ impl Game<'_> {
         }
         // Shot during this tick: they tick with the batch, as before.
         self.tick_projectiles(born, JoinSeq::MAX)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_join;
+    use horizon_client::join_seq::{JoinList, JoinSeq, Joined as _};
+
+    #[derive(Clone)]
+    struct E {
+        join: JoinSeq,
+    }
+    horizon_client::impl_joined!(E);
+
+    /// The run looks each entity up by join number: in a list in join order,
+    /// one put back out of order, and after the entity left.
+    #[test]
+    fn find_join_finds_by_number_in_or_out_of_order() {
+        let mut list = JoinList::default();
+        for _ in 0..5 {
+            list.push(E {
+                join: JoinSeq::UNJOINED,
+            });
+        }
+        let joins: Vec<JoinSeq> = list.iter().map(|e| e.join_seq()).collect();
+        for (i, &j) in joins.iter().enumerate() {
+            assert_eq!(find_join(&list, j), Some(i));
+        }
+        list.swap(0, 4);
+        list.swap(1, 3);
+        assert_eq!(find_join(&list, joins[0]), Some(4));
+        assert_eq!(find_join(&list, joins[4]), Some(0));
+        assert_eq!(find_join(&list, joins[1]), Some(3));
+        let gone = list.remove(2).join_seq();
+        assert_eq!(find_join(&list, gone), None);
     }
 }
