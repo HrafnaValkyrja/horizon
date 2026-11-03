@@ -4894,7 +4894,15 @@ pub fn {f}("
             }
         };
         let lines = std::cell::RefCell::new(Vec::new());
-        let log = |line: String| lines.borrow_mut().push(line);
+        // This test prepares one folder at a time, so nothing real is ever waited for. But the
+        // lock file is inherited for an instant by a process another test spawns in that
+        // moment, and the next try_lock then finds it held and says so (#8001). Every line about
+        // the assets is still collected and compared as before.
+        let log = |line: String| {
+            if !line.starts_with("Waiting for another horizon-prepare") {
+                lines.borrow_mut().push(line)
+            }
+        };
         let asset = |tag: &str, name: &str| {
             fs::read(resources_at(&versions.join(tag)).join("assets").join(name)).ok()
         };
