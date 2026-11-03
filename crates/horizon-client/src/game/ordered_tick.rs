@@ -1,4 +1,4 @@
-//! PURPOSE: ticks experience orbs, primed TNT and falling blocks in the order
+//! PURPOSE: ticks experience orbs, primed TNT, falling blocks, and firework rockets in the order
 //! they joined the level, between the other kinds' batches.
 //! WHY: `ServerLevel.tick` ticks every entity in join order, one kind among
 //! the rest; these three used to tick as three fixed batches (orbs after the
@@ -37,14 +37,13 @@ pub(super) enum Batch {
     Boats,
     Carts,
     Tridents,
-    Rockets,
     Items,
     Mobs,
     Projectiles,
 }
 
 impl Batch {
-    const COUNT: usize = 8;
+    const COUNT: usize = 7;
 }
 
 #[derive(Clone, Copy)]
@@ -52,6 +51,7 @@ enum Pending {
     Orb,
     Tnt,
     Falling,
+    Rocket,
 }
 
 /// The lowest join number in a batch, or none when it is empty.
@@ -67,7 +67,6 @@ impl Game<'_> {
             first_join(&self.boats),
             first_join(&self.carts),
             first_join(&self.tridents),
-            first_join(&self.rockets),
             first_join(&self.dropped),
             first_join(&self.mobs),
             first_join(&self.creatures.projectiles),
@@ -129,7 +128,7 @@ impl Game<'_> {
                 // Orbs are announced after their tick, always; TNT and falling
                 // blocks that joined since the last packets wait for them.
                 let right_pass = match kind {
-                    Pending::Orb => !late,
+                    Pending::Orb | Pending::Rocket => !late,
                     _ => late == (j >= announced),
                 };
                 if right_pass && wanted(j) && next.is_none_or(|(n, _)| j < n) {
@@ -141,6 +140,9 @@ impl Game<'_> {
             self.falling
                 .iter()
                 .for_each(|e| offer(e.join, Pending::Falling));
+            self.rockets
+                .iter()
+                .for_each(|e| offer(e.join, Pending::Rocket));
             let Some((join, kind)) = next else { break };
             self.ordered.done = Some(join);
             // ServerLevel.tick: only entities in entity-ticking chunks tick.
@@ -166,6 +168,11 @@ impl Game<'_> {
                         if let Err(e) = self.tick_one_falling(i) {
                             first_error.get_or_insert(e);
                         }
+                    }
+                }
+                Pending::Rocket => {
+                    if let Some(i) = self.rockets.iter().position(|e| e.join == join) {
+                        self.tick_one_rocket(i);
                     }
                 }
                 Pending::Orb => {

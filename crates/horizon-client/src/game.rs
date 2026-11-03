@@ -7540,8 +7540,7 @@ impl Game<'_> {
             horizon_client::spans::time("tick_fishing", || self.tick_fishing());
             self.ordered_before(ordered_tick::Batch::Tridents)?;
             horizon_client::spans::time("tick_tridents", || self.tick_tridents());
-            self.ordered_before(ordered_tick::Batch::Rockets)?;
-            horizon_client::spans::time("tick_rockets", || self.tick_rockets());
+            // Rockets tick in the join-order walk.
             horizon_client::spans::time("tick_ominous_item_spawners", || {
                 self.tick_ominous_item_spawners()
             });

@@ -357,14 +357,10 @@ impl Game<'_> {
         }
         true
     }
-    pub(super) fn tick_rockets(&mut self) {
-        let targets = if self.rockets.is_empty() {
-            Vec::new()
-        } else {
-            self.rocket_targets()
-        };
-        let mut i = 0;
-        while i < self.rockets.len() {
+    /// One firework rocket's `tick`; `i` is its place in the list.
+    pub(super) fn tick_one_rocket(&mut self, i: usize) {
+        let targets = self.rocket_targets();
+        {
             let mut r = self.rockets.remove(i);
             r.previous = r.position;
             // Projectile.tick: whether it has left its owner, before it moves.
@@ -439,10 +435,9 @@ impl Game<'_> {
             self.rocket_spark(&r);
             if r.life > r.lifetime {
                 self.explode_rocket(&r);
-                continue;
+                return;
             }
-            self.rockets.insert(i, r);
-            i += 1;
+            self.rockets.insert(i.min(self.rockets.len()), r);
         }
     }
     /// `FireworkRocketEntity.explode` and `dealExplosionDamage`.
