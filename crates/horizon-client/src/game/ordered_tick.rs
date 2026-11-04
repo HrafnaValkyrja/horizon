@@ -30,6 +30,10 @@ pub(super) struct OrderedTicks {
     lava_random: Option<horizon_core::random::LegacyRandom>,
     /// The breeze deflection's jitter, drawn on the tick's first projectile batch.
     pub(super) jitter: Option<f32>,
+    /// Set when an entity ticked here may have changed a mob, a boat or a
+    /// block (anything but a projectile pass that hit nothing); the mob loop
+    /// reads and clears it to know whether its view of the level is stale.
+    pub(super) touched: bool,
 }
 
 /// The batches of the other kinds, in the order they tick.
@@ -99,6 +103,7 @@ impl Game<'_> {
             suffix_min,
             lava_random: None,
             jitter: None,
+            touched: false,
         };
     }
 
@@ -114,7 +119,15 @@ impl Game<'_> {
         let wanted = |j: JoinSeq| done.is_none_or(|d| j > d) && j < born;
         let orbs = self.orbs.iter().map(|e| e.join);
         let rockets = self.rockets.iter().map(|e| e.join);
-        let shots = self.creatures.projectiles.iter().map(|p| p.join);
+        // A projectile stuck in a block ticks only its own age and fall check,
+        // which no other entity can see: it never cuts the mob loop (it ticks
+        // with the next pass, or the rest of the batch).
+        let shots = self
+            .creatures
+            .projectiles
+            .iter()
+            .filter(|p| !p.stuck)
+            .map(|p| p.join);
         let rest = self
             .tnts
             .iter()
@@ -165,16 +178,23 @@ impl Game<'_> {
             .iter()
             .for_each(|e| offer(e.join, Pending::Projectile));
         pending.sort_unstable_by_key(|&(j, _)| j);
-        let wind = |this: &Self, join: JoinSeq| {
-            this.creatures.projectiles.iter().any(|p| {
-                p.join == join
-                    && matches!(
-                        p.kind,
-                        horizon_client::projectiles::ProjectileKind::WindCharge
-                            | horizon_client::projectiles::ProjectileKind::BreezeWindCharge
-                    )
+        // The wind charges among them, found once (not a scan per projectile).
+        let winds: std::collections::HashSet<JoinSeq> = self
+            .creatures
+            .projectiles
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.kind,
+                    horizon_client::projectiles::ProjectileKind::WindCharge
+                        | horizon_client::projectiles::ProjectileKind::BreezeWindCharge
+                )
             })
-        };
+            .map(|p| p.join)
+            .collect();
+        let wind = |_: &Self, join: JoinSeq| winds.contains(&join);
+        // The rockets' targets, shared by consecutive rockets.
+        let mut rocket_targets = None;
         let mut at = 0;
         while at < pending.len() {
             let (join, kind) = pending[at];
@@ -197,12 +217,17 @@ impl Game<'_> {
                     pending.get(at).map_or(cut.min(born), |&(j, _)| j)
                 };
                 self.ordered.done = Some(last);
+                rocket_targets = None;
                 if let Err(e) = self.tick_projectiles(join, hi) {
                     first_error.get_or_insert(e);
                 }
                 continue;
             }
             self.ordered.done = Some(join);
+            self.ordered.touched = true;
+            if !matches!(kind, Pending::Rocket) {
+                rocket_targets = None;
+            }
             // ServerLevel.tick: only entities in entity-ticking chunks tick.
             match kind {
                 Pending::Tnt => {
@@ -231,7 +256,12 @@ impl Game<'_> {
                 Pending::Projectile => {}
                 Pending::Rocket => {
                     if let Some(i) = self.rockets.iter().position(|e| e.join == join) {
-                        self.tick_one_rocket(i);
+                        let targets = rocket_targets.get_or_insert_with(|| self.rocket_targets());
+                        let before = self.rockets.len();
+                        self.tick_one_rocket(i, targets);
+                        if self.rockets.len() != before {
+                            rocket_targets = None;
+                        }
                     }
                 }
                 Pending::Orb => {

@@ -1025,16 +1025,28 @@ impl Game<'_> {
             // starts from a fresh view.
             let mut pending = self.next_ordered_join();
             let mut start = 0;
+            // What a segment rebuilds only when something that ticked since
+            // may have changed it: the boats the mobs lead, the block writes
+            // that changed a collision shape (they were taken at the start of
+            // the tick, so they are the same for every segment), and the
+            // mobs' view of each other.
+            let mut path_changes: Option<Vec<[i32; 3]>> = None;
+            let mut stale = true;
+            self.ordered.touched = false;
             loop {
                 // All but the snapshot is the same for every mob of the tick, so
                 // build it once: the player view and the teams scan every UUID.
-                self.leash_boats = self
-                    .boats
-                    .iter()
-                    .map(super::boat_leads::boat_state)
-                    .collect();
+                if stale {
+                    self.leash_boats = self
+                        .boats
+                        .iter()
+                        .map(super::boat_leads::boat_state)
+                        .collect();
+                }
                 let base = self.mob_world_base(&[]);
-                let path_changes = horizon_client::mobs::collision_changes(&base, &path_writes);
+                let path_changes = &*path_changes.get_or_insert_with(|| {
+                    horizon_client::mobs::collision_changes(&base, &path_writes)
+                });
                 let mut resume = None;
                 for i in start..mobs.len() {
                     if let Some(due) = pending
@@ -1099,7 +1111,7 @@ impl Game<'_> {
                         continue;
                     }
                     horizon_client::mobs::apply_mob_pushes(m, &mut pushes);
-                    horizon_client::mobs::blocks_changed(m, &path_changes);
+                    horizon_client::mobs::blocks_changed(m, path_changes);
                     let from = events.len();
                     let kept = m.tick(&w, &mut scratch, &mut events);
                     // A killed mob's body is removed: its effects that act on
@@ -1169,16 +1181,19 @@ impl Game<'_> {
                 scratch = self.world.random.clone();
                 ran?;
                 pending = self.next_ordered_join().filter(|due| *due >= cut);
-                for (k, s) in snapshot.iter_mut().enumerate() {
-                    if let Some(m) = mobs.get(k) {
-                        let alive = s.alive;
-                        *s = seen(m, uuid);
-                        s.alive &= alive;
+                stale = std::mem::take(&mut self.ordered.touched);
+                if stale {
+                    for (k, s) in snapshot.iter_mut().enumerate() {
+                        if let Some(m) = mobs.get(k) {
+                            let alive = s.alive;
+                            *s = seen(m, uuid);
+                            s.alive &= alive;
+                        }
                     }
+                    grid = horizon_client::mobs::seen_grid::SeenGrid::new(
+                        snapshot.iter().map(|s| s.bounds),
+                    );
                 }
-                grid = horizon_client::mobs::seen_grid::SeenGrid::new(
-                    snapshot.iter().map(|s| s.bounds),
-                );
                 start = i;
             }
             let mut flags = keep.into_iter();
@@ -3865,6 +3880,12 @@ impl Game<'_> {
             // Drawn only when a breeze could deflect a projectile: an empty
             // level must not move the level random every tick.
             let due = |p: &Projectile| p.join >= lo && p.join < hi;
+            let any_wind = projectiles.iter().any(|p| {
+                matches!(
+                    p.kind,
+                    ProjectileKind::WindCharge | ProjectileKind::BreezeWindCharge
+                )
+            });
             let jitter = if breezes.is_empty() || !projectiles.iter().any(due) {
                 0.0
             } else {
@@ -3878,19 +3899,25 @@ impl Game<'_> {
             let scene = self.arrow_scene(&rain);
             // Mobs' projectiles also hit the guests (game/lan_mobs.rs).
             let guests = self.lan_projectile_targets();
-            let mut targets_guests = targets.clone();
-            targets_guests.extend(guests);
+            let has_guests = !guests.is_empty();
+            // Without guests the two lists are one: not copied.
+            let mut targets_guests = Vec::new();
+            if has_guests {
+                targets_guests = targets.clone();
+                targets_guests.extend(guests);
+            }
             let border = Some(self.border.bounds());
             let pw = ProjWorld {
                 w: &w,
                 targets,
                 border,
             };
-            let pw_guests = ProjWorld {
+            let pw_guests_own = ProjWorld {
                 w: &w,
                 targets: targets_guests,
                 border,
             };
+            let pw_guests = if has_guests { &pw_guests_own } else { &pw };
             let guest_entities = self.lan_guest_entities();
             // ThrownEnderpearl.tick: a dead player's pearl is discarded in
             // place of its tick while ender_pearls_vanish_on_death is on.
@@ -3910,8 +3937,9 @@ impl Game<'_> {
                 }
                 // A wind charge is pickable, so a pearl, an arrow or a trident can
                 // strike it (`Projectile.isPickable`, `Projectile.onHit`).
-                let winds = if matches!(projectiles[i].kind, ProjectileKind::EnderPearl)
-                    || projectiles[i].arrow.is_some()
+                let winds = if any_wind
+                    && (matches!(projectiles[i].kind, ProjectileKind::EnderPearl)
+                        || projectiles[i].arrow.is_some())
                 {
                     wind_charge_hitboxes(&projectiles, &keep_flags, i)
                 } else {
@@ -3956,7 +3984,7 @@ impl Game<'_> {
                         horizon_client::arrows::tick(p, &scene, &targets)
                     }
                     (false, false, true) => p.tick(&pw),
-                    (false, true, true) => p.tick(&pw_guests),
+                    (false, true, true) => p.tick(pw_guests),
                     (false, pvp_shot, false) => {
                         let mut targets = if pvp_shot {
                             pw_guests.targets.clone()
@@ -4060,6 +4088,16 @@ impl Game<'_> {
                     super::deflect::aim_deflect(wind, look, owner, owner_uuid, guest);
                 }
             }
+        }
+        // A pass that hit nothing and made no block or mob reaction leaves the
+        // level as the mob loop saw it.
+        if !hits.is_empty()
+            || !deflections.is_empty()
+            || !impacts.is_empty()
+            || !arrow_events.is_empty()
+            || keep_flags.iter().any(|k| !k)
+        {
+            self.ordered.touched = true;
         }
         let listed = keep_flags.clone();
         let mut idx = 0;

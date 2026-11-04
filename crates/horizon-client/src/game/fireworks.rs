@@ -358,8 +358,7 @@ impl Game<'_> {
         true
     }
     /// One firework rocket's `tick`; `i` is its place in the list.
-    pub(super) fn tick_one_rocket(&mut self, i: usize) {
-        let targets = self.rocket_targets();
+    pub(super) fn tick_one_rocket(&mut self, i: usize, targets: &[(Who, Aabb)]) {
         {
             let mut r = self.rockets.remove(i);
             r.previous = r.position;
@@ -394,10 +393,10 @@ impl Game<'_> {
                 }
             } else if r.attached {
                 self.follow_own_player(&mut r);
-                hit = self.rocket_struck(&targets, &r, r.velocity, skip);
+                hit = self.rocket_struck(targets, &r, r.velocity, skip);
             } else {
                 // getHitResultOnMoveVector before the move.
-                hit = self.rocket_struck(&targets, &r, r.next_motion(), skip);
+                hit = self.rocket_struck(targets, &r, r.next_motion(), skip);
                 let mut scene = SceneCollisions {
                     world: &self.world,
                     binding: self.collision,
@@ -559,7 +558,7 @@ impl Game<'_> {
     }
     /// What a rocket can hit (`Projectile.canHitEntity`): living mobs, the
     /// dragon's parts and crystals, the player and the guests.
-    fn rocket_targets(&self) -> Vec<(Who, Aabb)> {
+    pub(super) fn rocket_targets(&self) -> Vec<(Who, Aabb)> {
         let mut targets: Vec<(Who, Aabb)> = self
             .mobs
             .iter()
