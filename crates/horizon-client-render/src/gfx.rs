@@ -46,6 +46,8 @@ mod crumbling_tests;
 mod entity_batch;
 mod entity_outline;
 #[cfg(test)]
+mod inter_stage_tests;
+#[cfg(test)]
 pub(crate) mod test_gpu;
 mod weather;
 use entity_batch::EntityBatch;
@@ -7682,6 +7684,7 @@ impl Renderer {
                 frame.entities,
                 frame.entity_spans,
                 frame.crumbling_sprite,
+                frame.end_portal_sprites[1],
                 &mut self.pack_entity_rest,
                 skin.filter(|_| pack_skin),
             );
@@ -8386,6 +8389,14 @@ impl Renderer {
                 pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.set_vertex_buffer(1, self.instances.slice(..));
                 self.draw_sections(&mut pass, &self.indirect, 0, shadow_first, shadow_solid);
+            }
+            // `[displacement]`'s grid casts in place of the flat quads it took over.
+            if let Some((d, picks, pipeline)) = native
+                .displacement
+                .as_ref()
+                .and_then(|d| Some((d, d.shadow.as_ref()?, shadow.displaced.as_ref()?)))
+            {
+                d.draw(&mut pass, picks, pipeline);
             }
             drop(pass);
             let mut pass = native.frame.shadow_map.begin_translucent(
@@ -10578,6 +10589,18 @@ impl Frustum {
             );
             p.truncate().dot(v) + p.w < 0.0
         })
+    }
+    /// Whether a camera-relative sphere is at least partly inside. Frustum
+    /// planes are normalized, so each test needs only one dot product and a
+    /// radius comparison.
+    pub fn intersects_sphere(&self, center: Vec3, radius: f32) -> bool {
+        if !center.is_finite() || !radius.is_finite() || radius < 0.0 {
+            return true;
+        }
+        !self
+            .planes
+            .iter()
+            .any(|plane| plane.truncate().dot(center) + plane.w < -radius)
     }
     /// Whether the camera-relative box `min..max` is entirely inside. Then
     /// `intersects` accepts every box within it: each plane's distance only
